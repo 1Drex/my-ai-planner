@@ -57,13 +57,27 @@ export async function onRequestPost({ request, env }) {
       return Response.json({ error: 'Workers AI вернул пустой ответ.', diagnostic, plan: null }, { status: 502 });
     }
 
-    const cleaned = raw.replace(/^```(?:json|text)?\s*/i, '').replace(/\s*```$/, '').trim();
-    let parsed;
-    try { parsed = JSON.parse(cleaned); } catch {
-      const start = cleaned.indexOf('{'), end = cleaned.lastIndexOf('}');
-      if (start >= 0 && end > start) { try { parsed = JSON.parse(cleaned.slice(start, end + 1)); } catch {} }
+    function parseJsonEnvelope(value) {
+      if (typeof value !== 'string') return null;
+      const text = value.replace(/^```(?:json|text|javascript)?\s*/i, '').replace(/\s*```$/, '').trim();
+      const candidates = [text];
+      const start = text.indexOf('{'), end = text.lastIndexOf('}');
+      if (start >= 0 && end > start && !(start === 0 && end === text.length - 1)) candidates.push(text.slice(start, end + 1));
+      for (const candidate of candidates) {
+        try { const obj = JSON.parse(candidate); if (obj && typeof obj === 'object') return obj; } catch {}
+      }
+      return null;
     }
-    if (!parsed || typeof parsed.reply !== 'string') return Response.json({ reply: cleaned.slice(0, 5000), plan: null });
+
+    // Some model responses double-encode the contract: { reply: "{\"reply\":..., \"plan\":...}", plan: null }.
+    // Unwrap this case server-side so the browser receives the real reply and plan fields.
+    let parsed = parseJsonEnvelope(raw);
+    for (let depth = 0; depth < 3 && parsed && typeof parsed.reply === 'string'; depth++) {
+      const nested = parseJsonEnvelope(parsed.reply);
+      if (!nested || typeof nested.reply !== 'string') break;
+      parsed = { ...nested, plan: nested.plan ?? parsed.plan ?? null };
+    }
+    if (!parsed || typeof parsed.reply !== 'string') return Response.json({ reply: raw.slice(0, 5000), plan: null });
 
     let plan = null;
     if (parsed.plan && typeof parsed.plan.date === 'string' && Array.isArray(parsed.plan.tasks)) {
@@ -84,16 +98,22 @@ export async function onRequestPost({ request, env }) {
           };
         }).filter(t => t.duration >= 5);
 
-      const timed = tasks.filter(t => t.time).sort((a, b) => a.time.localeCompare(b.time));
-      const overlap = timed.some((t, i) => {
-        if (i === timed.length - 1) return false;
-        const next = timed[i + 1];
-        const [h, m] = t.time.split(':').map(Number);
-        const [nh, nm] = next.time.split(':').map(Number);
-        return h * 60 + m + t.duration > nh * 60 + nm;
+      const seenTitles = new Set();
+      const uniqueTasks = tasks.filter(t => {
+        const key = t.title.toLocaleLowerCase('ru-RU').replace(/\s+/g, ' ').trim();
+        if (seenTitles.has(key)) return false;
+        seenTitles.add(key); return true;
       });
-      if (validDate && tasks.length && !overlap) plan = { date, tasks };
-      else if (overlap) parsed.reply += '\nВ черновике обнаружилось пересечение времени, поэтому план нужно уточнить.';
+      const timed = uniqueTasks.filter(t => t.time).sort((a, b) => a.time.localeCompare(b.time));
+      const overlap = timed.some((t, i) => {
+        const start = t.time.split(':').map(Number).reduce((h, v, i) => i ? h + v : h * 60 + v, 0);
+        return timed.slice(i + 1).some(next => {
+          const [nh, nm] = next.time.split(':').map(Number);
+          return start + t.duration > nh * 60 + nm;
+        });
+      });
+      if (validDate && uniqueTasks.length && !overlap) plan = { date, tasks: uniqueTasks };
+      else if (overlap) parsed.reply += '\nВ черновике обнаружилось пересечение времени, поэтому план не предложен. Попробуйте уточнить задачи.';
     }
     return Response.json({ reply: parsed.reply.slice(0, 5000), plan });
   } catch (error) {
