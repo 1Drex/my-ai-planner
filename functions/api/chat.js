@@ -38,7 +38,7 @@ export async function onRequestPost({ request, env }) {
       temperature: 0.25
     });
 
-    const raw = typeof result?.response === 'string' ? result.response : (typeof result === 'string' ? result : '');
+    const raw = typeof result?.response === 'string' ? result.response : (typeof result === 'string' ? result : (typeof result?.result === 'string' ? result.result : (typeof result?.output === 'string' ? result.output : '')));
     let parsed;
     try {
       parsed = JSON.parse(raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, ''));
@@ -48,8 +48,12 @@ export async function onRequestPost({ request, env }) {
     }
 
     if (!parsed || typeof parsed.reply !== 'string') {
-      // Do not invent a plan when the model fails to return the agreed structure.
-      return Response.json({ reply: raw.trim() || 'Не получилось сформировать ответ. Попробуй переформулировать запрос.', plan: null });
+      // If the model returned ordinary text instead of JSON, preserve it as a reply.
+      // Never infer or apply a plan unless the model returned a valid structured plan.
+      const plainText = raw.trim().replace(/^```(?:json|text)?\s*/i, '').replace(/\s*```$/, '');
+      if (plainText) return Response.json({ reply: plainText.slice(0, 5000), plan: null });
+      const diagnostic = result && typeof result === 'object' ? JSON.stringify(result).slice(0, 1200) : '';
+      return Response.json({ reply: 'Модель не вернула текстовый ответ. Попробуй отправить сообщение ещё раз.', plan: null, diagnostic: diagnostic || undefined });
     }
 
     let plan = null;
