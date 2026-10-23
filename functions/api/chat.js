@@ -6,67 +6,91 @@ export async function onRequestPost({ request, env }) {
     if (!userMessage) return Response.json({ error: 'Пустое сообщение.' }, { status: 400 });
 
     const system = `Ты — дружелюбный и практичный русскоязычный ИИ-помощник личного планировщика.
-Твоя задача: понимать намерение пользователя, а не механически подставлять настройки.
-Правила планирования:
-- Не делай предположений, которых пользователь не просил. «Хочу встать без будильника» означает, что нельзя назначать фиксированный подъём; если точное время критично, задай один короткий уточняющий вопрос и верни plan:null.
-- Не превращай время окончания дня в длительность работы. Например, «позаниматься до 12, потом примерно до 17» НЕ означает автоматически 9 часов учёбы. Разбери естественный смысл; если фраза неоднозначна, уточни.
-- Учитывай названные обязательства, сон, перерывы, еду только если пользователь упомянул или это естественно и не навязывается. Оставляй буферы и отдых.
-- Если пользователь просто обсуждает варианты или ещё не выбрал план, не оформляй его как готовый план (plan:null). Если он просит составить план или явно выбирает вариант, подготовь его для подтверждения.
-- Никогда не утверждай, что задачи уже добавлены. Они будут добавлены только после отдельного нажатия кнопки пользователем.
-- План должен быть реалистичным: не назначай перекрывающиеся задачи; используй дату YYYY-MM-DD и время HH:MM в 24-часовом формате. Для фиксированных обязательств fixed:true, иначе false.
-- Если дата или длительность неясны настолько, что план может оказаться неправильным, задай один вопрос и верни plan:null.
-- Ответ короткий, естественный и по-русски. При готовом плане перечисли блоки, длительность и перерывы; не добавляй фиктивные пункты вроде «вставание» или «перерыв на завтрак», если пользователь не просил планировать их отдельными задачами.
+Понимай смысл запроса, не выдумывай расписание и не назначай фиксированный подъём, если человек хочет встать без будильника. Не превращай «заняться до 12, потом примерно до 17» в девять часов учёбы: если смысл важной части неясен, задай один короткий уточняющий вопрос и верни plan:null.
+Не добавляй фиктивные пункты вроде подъёма или завтрака, если их не просили планировать. Не утверждай, что задачи уже добавлены. План только предлагается и добавляется лишь после нажатия пользователем кнопки.
+Если план понятен, предложи реалистичные задачи без пересечений. Используй дату YYYY-MM-DD, время HH:MM (24 часа), duration — целое число минут. Для обязательств fixed:true, для гибких задач false.
+Верни только JSON без markdown в форме: {"reply":"короткий ответ на русском","plan":null} либо {"reply":"ответ","plan":{"date":"YYYY-MM-DD","tasks":[{"title":"Название","duration":90,"time":"10:00","priority":"normal","fixed":false,"notes":""}]}}. Если нужна уточняющая информация, plan должен быть null.`;
 
-Верни ТОЛЬКО корректный JSON без markdown и без текста до/после по схеме:
-{
-  "reply": "Текст ответа пользователю на русском языке",
-  "plan": null ИЛИ {
-    "date": "YYYY-MM-DD",
-    "tasks": [
-      {"title":"Название задачи","duration":90,"time":"10:00","priority":"normal","fixed":false,"notes":""}
-    ]
-  }
-}
-В JSON-ответе используй настоящие JSON-значения. duration — целое число минут; time — HH:MM или пустая строка, если точное время не задано. Не включай план, если сначала нужен уточняющий вопрос.`;
+    const messages = [
+      { role: 'system', content: system },
+      { role: 'user', content: userMessage }
+    ];
 
-    const result = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: userMessage }
-      ],
-      max_tokens: 1100,
-      temperature: 0.25
-    });
-
-    const raw = typeof result?.response === 'string' ? result.response : (typeof result === 'string' ? result : (typeof result?.result === 'string' ? result.result : (typeof result?.output === 'string' ? result.output : '')));
-    let parsed;
-    try {
-      parsed = JSON.parse(raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, ''));
-    } catch {
-      const match = raw.match(/\{[\s\S]*\}/);
-      if (match) { try { parsed = JSON.parse(match[0]); } catch {} }
+    // Workers AI usually returns { response: "..." }, but unwrap other response shapes too.
+    function extractText(value, depth = 0) {
+      if (depth > 5 || value == null) return '';
+      if (typeof value === 'string') return value;
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          const found = extractText(item, depth + 1);
+          if (found) return found;
+        }
+        return '';
+      }
+      if (typeof value === 'object') {
+        for (const key of ['response', 'output_text', 'text', 'content', 'generated_text', 'result', 'output']) {
+          if (key in value) {
+            const found = extractText(value[key], depth + 1);
+            if (found) return found;
+          }
+        }
+        if (value.choices?.[0]?.message?.content) return extractText(value.choices[0].message.content, depth + 1);
+      }
+      return '';
     }
 
+    let result;
+    let raw = '';
+    // Retry once if the model returns an empty response.
+    for (let attempt = 0; attempt < 2 && !raw.trim(); attempt++) {
+      result = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
+        messages,
+        max_tokens: 1200,
+        temperature: 0.2
+      });
+      raw = extractText(result).trim();
+    }
+
+    if (!raw) {
+      const diagnostic = result && typeof result === 'object' ? JSON.stringify(result).slice(0, 800) : String(result ?? 'empty result');
+      return Response.json({
+        reply: 'Cloudflare Workers AI вернул пустой ответ после двух попыток. Проверь журнал Functions в Cloudflare Pages: там будет видно, почему модель не вернула текст.',
+        plan: null,
+        diagnostic
+      }, { status: 502 });
+    }
+
+    const cleaned = raw.replace(/^```(?:json|text)?\s*/i, '').replace(/\s*```$/, '').trim();
+    let parsed;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch {
+      const start = cleaned.indexOf('{');
+      const end = cleaned.lastIndexOf('}');
+      if (start >= 0 && end > start) {
+        try { parsed = JSON.parse(cleaned.slice(start, end + 1)); } catch {}
+      }
+    }
+
+    // If JSON formatting fails, still show the model's actual answer as ordinary text.
     if (!parsed || typeof parsed.reply !== 'string') {
-      // If the model returned ordinary text instead of JSON, preserve it as a reply.
-      // Never infer or apply a plan unless the model returned a valid structured plan.
-      const plainText = raw.trim().replace(/^```(?:json|text)?\s*/i, '').replace(/\s*```$/, '');
-      if (plainText) return Response.json({ reply: plainText.slice(0, 5000), plan: null });
-      const diagnostic = result && typeof result === 'object' ? JSON.stringify(result).slice(0, 1200) : '';
-      return Response.json({ reply: 'Модель не вернула текстовый ответ. Попробуй отправить сообщение ещё раз.', plan: null, diagnostic: diagnostic || undefined });
+      return Response.json({ reply: cleaned.slice(0, 5000), plan: null });
     }
 
     let plan = null;
     if (parsed.plan && typeof parsed.plan.date === 'string' && Array.isArray(parsed.plan.tasks)) {
       const validDate = /^\d{4}-\d{2}-\d{2}$/.test(parsed.plan.date);
-      const tasks = parsed.plan.tasks.filter(t => t && typeof t.title === 'string' && t.title.trim()).slice(0, 20).map(t => ({
-        title: t.title.trim().slice(0, 140),
-        duration: Math.max(5, Math.min(1440, Math.round((Number(t.duration) || 60) / 5) * 5)),
-        time: /^([01]\d|2[0-3]):[0-5]\d$/.test(t.time || '') ? t.time : '',
-        priority: ['high', 'normal', 'low'].includes(t.priority) ? t.priority : 'normal',
-        fixed: Boolean(t.fixed),
-        notes: typeof t.notes === 'string' ? t.notes.slice(0, 500) : ''
-      }));
+      const tasks = parsed.plan.tasks
+        .filter(t => t && typeof t.title === 'string' && t.title.trim())
+        .slice(0, 20)
+        .map(t => ({
+          title: t.title.trim().slice(0, 140),
+          duration: Math.max(5, Math.min(1440, Math.round((Number(t.duration) || 60) / 5) * 5)),
+          time: /^([01]\d|2[0-3]):[0-5]\d$/.test(t.time || '') ? t.time : '',
+          priority: ['high', 'normal', 'low'].includes(t.priority) ? t.priority : 'normal',
+          fixed: Boolean(t.fixed),
+          notes: typeof t.notes === 'string' ? t.notes.slice(0, 500) : ''
+        }));
       if (validDate && tasks.length) plan = { date: parsed.plan.date, tasks };
     }
     return Response.json({ reply: parsed.reply.slice(0, 5000), plan });
