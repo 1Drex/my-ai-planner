@@ -21,6 +21,14 @@ export async function onRequestPost({ request, env }) {
 
     const system = `Ты — дружелюбный, внимательный русскоязычный помощник личного планировщика. Веди непрерывный диалог и учитывай историю. Короткие реплики «до 12», «нет, после 12», «я имел в виду» относятся к последнему обсуждаемому вопросу или плану. Исправляй понимание, не начинай разговор заново и не задавай повторно вопросы, на которые уже ответили.
 Максимум один уточняющий вопрос за ответ; спрашивай только если без этого нельзя сделать разумный план.
+КРИТИЧЕСКИ ВАЖНО ДЛЯ ДИАЛОГА:
+- Всегда сначала прочитай историю. Не повторяй вопрос, на который пользователь уже ответил.
+- Если ранее ты задал вопрос и пользователь отвечает коротко («да», «нет», «3 часа», «240 минут», «в 17:30»), трактуй ответ в контексте предыдущих реплик.
+- Если пользователь отвечает «да» на твоё предложение/уточнение о реализуемости плана, это подтверждение: немедленно сформируй структурированный plan, не задавай тот же вопрос повторно.
+- Если пользователь уже назвал начало и длительность учёбы, данных достаточно для плана. Не проси ещё раз указать длительность.
+- Числа длительности интерпретируй буквально: «3 часа» = 180 минут, «240 минут» = 240 минут. Если пользователь позже явно исправил значение, используй самое позднее значение.
+- Если ответ «да» подтверждает пример на 240 минут, планируй 240 минут учёбы; не превращай это значение в другое.
+- Если можешь составить разумный черновик на основании контекста, верни plan, а не plan:null. Не продолжай бесконечное уточнение.
 
 СМЫСЛ:
 - «Хочу встать без будильника» означает свободное утро без фиксированного времени пробуждения. Не создавай задачи «Подъём», «Вставание», «Проснуться» и не проси время подъёма.
@@ -111,13 +119,33 @@ export async function onRequestPost({ request, env }) {
     }
 
     let parsed = parseEnvelope(cleaned);
+    // A bare affirmative after the assistant proposed a plan means confirmation, not a new request for clarification.
+    const currentRequest = (userMessage.match(/(?:^|\n)Запрос пользователя:\s*([^\n]+)/i)?.[1] || userMessage).trim();
+    const currentIsAffirmative = /^(?:да|да,?\s*(?:давай|составляй|подходит|реалистично|верно)?|думаю,?\s*да|ок|хорошо|согласен|согласна)[.!?\s]*$/i.test(currentRequest);
+    if (parsed && !parsed.plan && currentIsAffirmative) {
+      try {
+        const retry = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
+          messages: [
+            { role: 'system', content: system + '\n\nОСОБОЕ УКАЗАНИЕ: последняя реплика пользователя — подтверждение твоего предыдущего предложения. Не задавай вопрос. Составь структурированный план на основе всей истории и уже указанных ограничений. Верни JSON с plan.tasks, если только в истории действительно нет никаких задач или временных ограничений.' },
+            ...history,
+            { role: 'user', content: userMessage }
+          ],
+          max_tokens: 1600,
+          temperature: 0
+        });
+        const retryParsed = parseEnvelope(extractText(retry).trim().replace(/^```(?:json|text)?\s*/i, '').replace(/\s*```$/, '').trim());
+        if (retryParsed && retryParsed.plan) parsed = retryParsed;
+      } catch (error) {
+        console.error('[chat] affirmative-plan retry failed:', error?.message || error);
+      }
+    }
     if (!parsed) {
       // One repair attempt: ask the model to return a valid envelope, preserving the original request/history.
       try {
         const repair = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
           messages: [
-            { role: 'system', content: 'Преобразуй ответ в корректный JSON строго вида {"reply":"...","plan":null} или {"reply":"...","plan":{"date":"YYYY-MM-DD","tasks":[...]}}. Сохрани смысл, исправь только JSON-синтаксис. Не добавляй Markdown и никаких пояснений.' },
-            { role: 'user', content: cleaned.slice(0, 9000) }
+            { role: 'system', content: 'Верни корректный JSON строго вида {\"reply\":\"...\",\"plan\":null} или {\"reply\":\"...\",\"plan\":{\"date\":\"YYYY-MM-DD\",\"tasks\":[...]}}. Если исходный ответ содержит JSON, исправь его синтаксис и сохрани смысл. Если исходный ответ не содержит пригодного плана, составь план по запросу пользователя и истории. Не добавляй Markdown и никаких пояснений вне JSON.' },
+            { role: 'user', content: ('Исходный запрос пользователя и контекст:\n' + userMessage + '\n\nПредыдущий ответ модели для восстановления, если полезен:\n' + cleaned).slice(0, 9000) }
           ],
           max_tokens: 1600,
           temperature: 0
@@ -132,7 +160,20 @@ export async function onRequestPost({ request, env }) {
       });
     }
 
-    let reply = parsed.reply.slice(0, 5000);
+    // Detect a conversational loop: the model repeats its previous assistant reply verbatim.
+    // Compare only parsed reply text, and only when no usable plan accompanies it.
+    const lastAssistant = [...history].reverse().find(m => m.role === 'assistant');
+    const normalizeForLoop = value => String(value || '').trim().replace(/\s+/g, ' ');
+    if (lastAssistant && parsed.reply && !parsed.plan &&
+        normalizeForLoop(lastAssistant.content) === normalizeForLoop(parsed.reply)) {
+      return jsonResponse({
+        reply: 'Похоже, я зациклился на предыдущем ответе. Давай переформулируем запрос — что именно нужно сделать?',
+        plan: null
+      });
+    }
+
+    let reply = typeof parsed.reply === 'string' ? parsed.reply.slice(0, 5000) : '';
+    if (!reply.trim()) reply = 'ИИ вернул пустой ответ.';
     let plan = null;
     let planWasSupplied = parsed.plan != null;
     let planDiscardReason = '';
@@ -144,7 +185,9 @@ export async function onRequestPost({ request, env }) {
         new Date(date + 'T00:00:00Z').toISOString().slice(0, 10) === date;
 
       const rawTasks = parsed.plan.tasks.slice(0, 30);
-      const hasInvalidFixed = rawTasks.some(t => t && t.fixed === true && !(typeof t.time === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(t.time)));
+      const isFixed = v => v === true || v === 'true' || v === 1;
+      const validTaskTime = v => typeof v === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(v);
+      const hasInvalidFixed = rawTasks.some(t => t && isFixed(t.fixed) && !validTaskTime(t.time));
       const tasks = rawTasks
         .filter(t => t && typeof t.title === 'string' && t.title.trim())
         .filter(t => !/^(подъ[её]м|вставание|проснуться|пробуждение)$/i.test(t.title.trim()))
@@ -156,11 +199,23 @@ export async function onRequestPost({ request, env }) {
             duration,
             time: typeof t.time === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(t.time) ? t.time : '',
             priority: ['high', 'normal', 'low'].includes(t.priority) ? t.priority : 'normal',
-            fixed: Boolean(t.fixed),
+            fixed: isFixed(t.fixed) && validTaskTime(t.time),
             notes: typeof t.notes === 'string' ? t.notes.slice(0, 500) : ''
           };
         })
         .filter(t => t.duration >= 5);
+
+      // If the model returned one long timed study task and also invented breaks beside it,
+      // the client will split the long task and create breaks deterministically. Drop those
+      // model-generated breaks before overlap validation so they cannot invalidate the plan.
+      const hasLongTimedStudy = tasks.some(t =>
+        t.time && t.duration > 120 && /(уч[её]б|учиться|обучен|подготовк|программирован|лабораторн|домашн.{0,10}задан|чтени|работ.{0,10}над)/i.test(t.title)
+      );
+      if (hasLongTimedStudy) {
+        for (let i = tasks.length - 1; i >= 0; i--) {
+          if (/^перерыв(?: между учебными блоками)?$/i.test(tasks[i].title.trim())) tasks.splice(i, 1);
+        }
+      }
 
       const timed = tasks.filter(t => t.time).map(t => {
         const [h, m] = t.time.split(':').map(Number);
