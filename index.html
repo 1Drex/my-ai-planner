@@ -137,10 +137,34 @@ function normalizeAIResponse(data){
  if(!envelope&&typeof data?.output==='string')envelope=parseAIEnvelope(data.output);
  if(envelope){reply=envelope.reply; if(envelope.plan&&Array.isArray(envelope.plan.tasks))plan=envelope.plan;}
  if(!reply)reply='ИИ вернул пустой ответ.';
- // Reject malformed/unsafe plan shapes; the apply button only appears for usable plans.
- if(!plan||typeof plan.date!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(plan.date)||!Array.isArray(plan.tasks))plan=null;
- else {plan={date:plan.date,tasks:plan.tasks.filter(t=>t&&typeof t.title==='string'&&t.title.trim()&&Number.isFinite(Number(t.duration))&&Number(t.duration)>=5).map(t=>({title:t.title.trim(),duration:Math.max(5,Math.min(1440,Math.round(Number(t.duration)/5)*5)),time:/^([01]\d|2[0-3]):[0-5]\d$/.test(t.time||'')?t.time:'',priority:['high','normal','low'].includes(t.priority)?t.priority:'normal',fixed:!!t.fixed,notes:typeof t.notes==='string'?t.notes:''})).filter(t=>!/^(подъ[её]м|вставание|проснуться|пробуждение)$/i.test(t.title))};if(!plan.tasks.length)plan=null;}
- return {reply,plan};
+ if(!plan||typeof plan.date!=='string'||!/^(\d{4})-(\d{2})-(\d{2})$/.test(plan.date)||!Array.isArray(plan.tasks))return {reply,plan:null};
+ const validTime=v=>/^([01]\d|2[0-3]):[0-5]\d$/.test(v||'');
+ const toMin=v=>{const [h,m]=v.split(':').map(Number);return h*60+m};
+ let items=plan.tasks.filter(t=>t&&typeof t.title==='string'&&t.title.trim()&&Number.isFinite(Number(t.duration))&&Number(t.duration)>=5)
+  .map(t=>({title:t.title.trim(),duration:Math.max(5,Math.min(1440,Math.round(Number(t.duration)/5)*5)),time:validTime(t.time)?t.time:'',priority:['high','normal','low'].includes(t.priority)?t.priority:'normal',fixed:!!t.fixed,notes:typeof t.notes==='string'?t.notes:''}))
+  .filter(t=>!/^(подъ[её]м|вставание|проснуться|пробуждение)$/i.test(t.title));
+ // A long study block is never accepted as one continuous task. Split it into blocks and explicit breaks.
+ const expanded=[];
+ const studyName=t=>/(уч[её]б|учиться|обучен|подготовк|программирован|лабораторн|домашн.{0,10}задан|чтени|работ.{0,10}над)/i.test(t.title);
+ // If the assistant explicitly states a deadline in its reply, keep the generated blocks within that window.
+ const deadlineMatches=[...reply.matchAll(/(?:до|к)\s*(\d{1,2})(?::([0-5]\d))?/gi)]; const deadlineMatch=deadlineMatches.length?deadlineMatches[deadlineMatches.length-1]:null;
+ const deadline=deadlineMatch?Number(deadlineMatch[1])*60+Number(deadlineMatch[2]||0):null;
+ for(const t of items){
+  if(studyName(t)&&t.duration>120&&t.time){
+   const start=toMin(t.time);
+   let work=t.duration;
+   if(deadline!==null&&deadline>start){const span=deadline-start;const breaks=Math.max(0,Math.ceil(span/90)-1)*10;work=Math.min(work,Math.max(45,span-breaks));}
+   let cursor=start,left=work,block=1;
+   while(left>0){const chunk=Math.min(90,left);expanded.push({...t,title:`${t.title} — блок ${block++}`,duration:chunk,time:String(Math.floor(cursor/60)).padStart(2,'0')+':'+String(cursor%60).padStart(2,'0')});cursor+=chunk;left-=chunk;if(left>0){expanded.push({title:'Перерыв',duration:10,time:String(Math.floor(cursor/60)).padStart(2,'0')+':'+String(cursor%60).padStart(2,'0'),priority:'low',fixed:false,notes:'Перерыв между учебными блоками'});cursor+=10;}}
+  } else expanded.push(t);
+ }
+ // Remove duplicate ordinary tasks inside the proposed plan, but allow separate numbered study blocks.
+ const seen=new Set();
+ items=[];
+ for(const t of expanded){const key=t.title.toLocaleLowerCase('ru-RU')+'|'+t.time;if(seen.has(key))continue;seen.add(key);items.push(t)}
+ const timed=items.filter(t=>t.time).sort((a,b)=>toMin(a.time)-toMin(b.time));
+ for(let i=0;i<timed.length-1;i++){if(toMin(timed[i].time)+timed[i].duration>toMin(timed[i+1].time)){return {reply:reply+'\nЯ обнаружил пересечение времени в предложении и не показываю его для добавления. Попробуй попросить меня составить план заново.',plan:null};}}
+ return {reply,plan:items.length?{date:plan.date,tasks:items}:null};
 }
 function applyAIPlan(index){
  const m=aiHistory[index];if(!m?.plan?.tasks?.length)return;
