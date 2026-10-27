@@ -89,6 +89,14 @@ export async function onRequestPost({ request, env }) {
     }
 
     const cleaned = raw.replace(/^```(?:json|text)?\s*/i, '').replace(/\s*```$/, '').trim();
+    // A long verbatim copy of the planner context is a failed generation, not a useful answer.
+    const echoProbe = userMessage.length >= 300 ? userMessage.slice(0, 240) : '';
+    if (echoProbe && cleaned.includes(echoProbe)) {
+      return jsonResponse({
+        reply: 'ИИ повторил контекст вместо ответа. Попробуй отправить запрос ещё раз короче; задачи не изменены.',
+        plan: null
+      }, 502);
+    }
     function parseEnvelope(text) {
       const candidates = [text];
       const start = text.indexOf('{'), end = text.lastIndexOf('}');
@@ -136,6 +144,7 @@ export async function onRequestPost({ request, env }) {
         new Date(date + 'T00:00:00Z').toISOString().slice(0, 10) === date;
 
       const rawTasks = parsed.plan.tasks.slice(0, 30);
+      const hasInvalidFixed = rawTasks.some(t => t && t.fixed === true && !(typeof t.time === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(t.time)));
       const tasks = rawTasks
         .filter(t => t && typeof t.title === 'string' && t.title.trim())
         .filter(t => !/^(подъ[её]м|вставание|проснуться|пробуждение)$/i.test(t.title.trim()))
@@ -168,6 +177,7 @@ export async function onRequestPost({ request, env }) {
       }
 
       if (!validDate) planDiscardReason = 'Указана некорректная дата.';
+      else if (hasInvalidFixed) planDiscardReason = 'Фиксированное событие не содержит корректного времени начала.';
       else if (!tasks.length) planDiscardReason = 'Все задачи в черновике имели некорректную или слишком короткую длительность.';
       else if (overlap) planDiscardReason = 'В черновике обнаружилось пересечение времени.';
       else if (timed.some(t => t.start + t.duration > 1440)) planDiscardReason = 'Одна из задач выходит за пределы суток.';
@@ -178,9 +188,12 @@ export async function onRequestPost({ request, env }) {
 
     if (planWasSupplied && !plan) {
       reply += '\n\nЯ не передаю черновик в расписание: ' + (planDiscardReason || 'план не прошёл проверку.') + ' Попробуй попросить меня составить план заново.';
+    } else if (!plan && /(?:вот (?:твой |ваш )?план|план готов|составил(?:а)? план|расписание готово|я распределил(?:а)? задачи)/i.test(reply)) {
+      reply += '\n\nВажно: структурированный черновик не был получен, поэтому задачи не добавлены. Попроси меня повторить построение плана.';
     }
     return jsonResponse({ reply, plan });
   } catch (error) {
-    return jsonResponse({ error: error?.message || 'Внутренняя ошибка ИИ.' }, 500);
+    console.error('[chat] Workers AI request failed:', error?.stack || error?.message || error);
+    return jsonResponse({ error: 'Не удалось обработать запрос ИИ. Попробуй ещё раз.' }, 500);
   }
 }
