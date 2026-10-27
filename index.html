@@ -52,7 +52,7 @@ const mins=t=>{const [h,m]=t.split(':').map(Number);return h*60+m};
 const hm=m=>`${String(Math.floor(m/60)%24).padStart(2,'0')}:${String(m%60).padStart(2,'0')}`;
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function makeId(){return (window.crypto&&typeof window.crypto.randomUUID==='function')?window.crypto.randomUUID():('task-'+Date.now()+'-'+Math.random().toString(36).slice(2,10))}
-let selectedDate=todayKey(),proposal=null;
+let selectedDate=todayKey(),proposal=null,proposalSignature='';
 let tasks=[],settings={wakeTime:'07:30',sleepTime:'00:00',dayStart:'07:30',dayEnd:'23:30',breakMin:10,planStyle:'balanced'};
 function load(){try{tasks=JSON.parse(localStorage.getItem('myday_tasks')||'[]');settings={...settings,...JSON.parse(localStorage.getItem('myday_settings')||'{}')}}catch(e){}}
 function save(){localStorage.setItem('myday_tasks',JSON.stringify(tasks));localStorage.setItem('myday_settings',JSON.stringify(settings))}
@@ -88,38 +88,51 @@ function changeMonth(delta){
 }
 function dayTasks(){return tasks.filter(t=>t.date===selectedDate)}
 function buildSchedule(items){
- const startDay=mins(settings.dayStart),endDay=mins(settings.dayEnd),buffer=Math.max(0,Number(settings.breakMin)||0);
- const sorted=items.slice().sort((a,b)=>{if(a.fixed!==b.fixed)return a.fixed?-1:1;if(a.time&&b.time)return a.time.localeCompare(b.time);if(a.time)return -1;if(b.time)return 1;const p={high:0,normal:1,low:2};return (p[a.priority]??1)-(p[b.priority]??1)});
- const fixed=sorted.filter(t=>t.fixed&&t.time).map(task=>({task,start:mins(task.time),end:mins(task.time)+Number(task.duration||0),fixed:true}));
- const out=fixed.map(x=>({...x,unplaced:x.start<startDay||x.end>endDay}));
- const flex=sorted.filter(t=>!(t.fixed&&t.time));
- let cursor=startDay;
- for(const task of flex){
-  const duration=Number(task.duration)||0;
-  let candidate=task.time?Math.max(startDay,mins(task.time)):cursor;
-  let placed=false;
-  for(let guard=0;guard<items.length+fixed.length+5;guard++){
-   let conflict=null;
-   for(const occupied of out){
-    const pad=occupied.fixed||task.time?buffer:0;
-    if(candidate < occupied.end+pad && candidate+duration > occupied.start-pad){conflict=occupied;break}
-   }
-   if(!conflict){placed=candidate+duration<=endDay;break}
-   candidate=Math.max(candidate+1,conflict.end+buffer);
-  }
-  if(placed){
-   out.push({task,start:candidate,end:candidate+duration,fixed:false,unplaced:false});
-   if(!task.time)cursor=candidate+duration+buffer;
-  }else{
-   out.push({task,start:null,end:null,fixed:false,unplaced:true});
-  }
+ // Deterministic interval scheduler: fixed events are immutable anchors; flexible tasks
+ // are placed into gaps and marked unplaced rather than silently overlapping.
+ const dayStart=mins(settings.dayStart),dayEnd=mins(settings.dayEnd);
+ const breakMin=Math.max(0,Math.min(60,Number(settings.breakMin)||0));
+ const validDuration=t=>Number.isFinite(Number(t.duration))&&Number(t.duration)>0;
+ const fixed=items.filter(t=>t.fixed&&t.time&&validDuration(t)).map(task=>({task,start:mins(task.time),end:mins(task.time)+Number(task.duration),fixed:true,unplaced:false})).sort((a,b)=>a.start-b.start);
+ const out=[];
+ for(let i=0;i<fixed.length;i++){
+  const f=fixed[i];
+  const outside=f.start<dayStart||f.end>dayEnd||f.end>1440;
+  const overlaps=fixed.slice(0,i).some(prev=>f.start<prev.end&&f.end>prev.start);
+  out.push({...f,unplaced:outside||overlaps,issue:outside?'outside-window':overlaps?'fixed-overlap':null});
  }
- return out.sort((a,b)=>{
-  if(a.start===null)return 1;if(b.start===null)return -1;return a.start-b.start
+ const flexible=items.filter(t=>!(t.fixed&&t.time)).filter(validDuration).sort((a,b)=>{
+  const pri={high:0,normal:1,low:2};
+  if(settings.planStyle==='focus'){const d=(pri[a.priority]??1)-(pri[b.priority]??1);if(d)return d;}
+  if(a.time&&b.time)return a.time.localeCompare(b.time);
+  if(a.time)return -1;if(b.time)return 1;
+  return (pri[a.priority]??1)-(pri[b.priority]??1);
  });
+ let cursor=dayStart;
+ for(const task of flexible){
+  const duration=Number(task.duration);
+  const preferred=task.time?mins(task.time):null;
+  let candidate=Math.max(dayStart,preferred===null?cursor:preferred);
+  let placed=null;
+  // Scan forward across occupied intervals. Existing invalid fixed conflicts are
+  // treated as occupied too: flexible work must never make an impossible day worse.
+  for(let guard=0;guard<items.length*3+20;guard++){
+   if(candidate+duration>dayEnd||candidate+duration>1440)break;
+   const conflicts=out.filter(x=>x.start!==null&&x.end!==null&&candidate<x.end+breakMin&&candidate+duration>x.start-breakMin);
+   if(!conflicts.length){placed={task,start:candidate,end:candidate+duration,fixed:false,unplaced:false};break;}
+   const next=Math.max(...conflicts.map(x=>x.end+breakMin));
+   if(next<=candidate)break;
+   candidate=next;
+  }
+  if(placed){out.push(placed);if(preferred===null)cursor=placed.end+breakMin;}
+  else out.push({task,start:null,end:null,fixed:false,unplaced:true,issue:'no-room'});
+ }
+ // Invalid/zero-duration tasks remain visible as unplaced so they cannot disappear silently.
+ for(const task of items.filter(t=>!validDuration(t))){out.push({task,start:null,end:null,fixed:!!task.fixed,unplaced:true,issue:'invalid-duration'});}
+ return out.sort((a,b)=>{if(a.start===null)return 1;if(b.start===null)return -1;return a.start-b.start;});
 }
 function render(){renderDates();const list=dayTasks(),done=list.filter(t=>t.done).length,scheduled=list.filter(t=>t.start||t.time).length;const total=list.reduce((s,t)=>s+t.duration,0);$('statDone').textContent=`${done}/${list.length}`;$('statHours').textContent=(total/60).toLocaleString('ru-RU',{maximumFractionDigits:1})+' ч';$('heroPercent').textContent=(list.length?Math.round(done/list.length*100):0)+'%';$('heroSub').textContent=list.length?`На сегодня ${list.length} ${plural(list.length,'задача','задачи','задач')}. Маленькими шагами — к большому результату.`:'Добавь дела — я помогу распределить их по дню.';$('greeting').textContent=done===list.length&&list.length?'Отличная работа! 🎉':'Всё по силам.';const schedule=buildSchedule(list);let occupied=schedule.filter(x=>!x.unplaced).reduce((s,x)=>s+x.task.duration,0);$('statFree').textContent=Math.max(0,Math.floor((mins(settings.dayEnd)-mins(settings.dayStart)-occupied)/60))+' ч';$('taskCount').textContent=`${list.length} ${plural(list.length,'задача','задачи','задач')}`;$('rulesSummary').innerHTML=`Подъём: ${esc(settings.wakeTime)} · Сон: ${esc(settings.sleepTime)}<br>Планирование: ${esc(settings.dayStart)}–${esc(settings.dayEnd)}<br>Перерыв: ${settings.breakMin} мин · Изменения: после подтверждения`;
-$('timeline').innerHTML=schedule.length?schedule.map(x=>`<div class="slot"><div class="time">${x.unplaced?'—':hm(x.start)}</div><div class="rail"><div class="dot"></div></div><div class="event ${x.task.fixed?'fixed':'flexible'}"><strong>${esc(x.task.title)}</strong><small>${x.unplaced?'Не помещается в доступное окно — выбери другое время или сократи длительность.':`${hm(x.start)}–${hm(x.end)} · ${x.task.duration} мин${x.task.fixed?' · фиксировано':''}`}</small></div></div>`).join(''):'<div class="card empty">Пока нет задач на эту дату.<br>Добавь первую — и соберём план.</div>';
+$('timeline').innerHTML=schedule.length?schedule.map(x=>`<div class="slot"><div class="time">${x.unplaced?'—':hm(x.start)}</div><div class="rail"><div class="dot"></div></div><div class="event ${x.task.fixed?'fixed':'flexible'}"><strong>${esc(x.task.title)}</strong><small>${x.unplaced?(x.issue==='fixed-overlap'?'Конфликт фиксированных событий — исправь время вручную.':x.issue==='outside-window'?'Вне рабочего окна — измени время или рабочие границы.':x.issue==='invalid-duration'?'Некорректная длительность — открой задачу и исправь её.':'Не помещается в доступное окно — выбери другое время или сократи длительность.'):`${hm(x.start)}–${hm(x.end)} · ${x.task.duration} мин${x.task.fixed?' · фиксировано':''}`}</small></div></div>`).join(''):'<div class="card empty">Пока нет задач на эту дату.<br>Добавь первую — и соберём план.</div>';
 $('taskList').innerHTML=list.length?list.slice().sort((a,b)=>(a.done?1:0)-(b.done?1:0)).map(t=>`<div class="card task ${t.done?'done':''}"><button class="check" data-check="${t.id}" aria-label="Отметить выполненной">${t.done?'✓':''}</button><div><div class="task-title">${esc(t.title)}</div><div class="task-meta"><span>${t.time?esc(t.time)+' · ':''}${t.duration} мин</span><span class="tag ${t.priority==='high'?'high':''}">${t.priority==='high'?'Важно':t.priority==='low'?'Можно позже':'Обычная'}</span>${t.fixed?'<span class="tag fixed">Фиксировано</span>':''}</div>${t.notes?`<div class="muted" style="margin-top:7px">${esc(t.notes)}</div>`:''}</div><div class="task-actions"><button class="iconbtn" data-edit="${t.id}" aria-label="Изменить">✎</button><button class="iconbtn" data-delete="${t.id}" aria-label="Удалить">×</button></div></div>`).join(''):'<div class="card empty">Здесь появятся твои задачи.</div>';
 document.querySelectorAll('[data-check]').forEach(b=>b.onclick=()=>{const t=tasks.find(x=>x.id===b.dataset.check);t.done=!t.done;save();render()});document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>editTask(b.dataset.edit));document.querySelectorAll('[data-delete]').forEach(b=>b.onclick=()=>{tasks=tasks.filter(x=>x.id!==b.dataset.delete);save();render();toast('Задача удалена')})}
 function plural(n,a,b,c){let x=n%10,y=n%100;return y>=11&&y<=14?c:x===1?a:x>=2&&x<=4?b:c}
@@ -149,11 +162,12 @@ function quickAdd(){
 }
 $('quickAdd').onclick=quickAdd;$('quickInput').addEventListener('keydown',e=>{if(e.key==='Enter')quickAdd()});
 function openSettings(){$('wakeTime').value=settings.wakeTime;$('sleepTime').value=settings.sleepTime;$('dayStart').value=settings.dayStart;$('dayEnd').value=settings.dayEnd;$('breakMin').value=settings.breakMin;$('planStyle').value=settings.planStyle;open('settingsOverlay')}
-$('settingsOpen').onclick=openSettings;$('settingsForm').onsubmit=e=>{e.preventDefault();settings={wakeTime:$('wakeTime').value,sleepTime:$('sleepTime').value,dayStart:$('dayStart').value,dayEnd:$('dayEnd').value,breakMin:Number($('breakMin').value),planStyle:$('planStyle').value};save();close('settingsOverlay');render();toast('Правила сохранены')};
-$('replan').onclick=()=>{const list=dayTasks();if(!list.length){toast('Сначала добавь хотя бы одну задачу');return}proposal=buildSchedule(list);$('proposalList').innerHTML=proposal.map(x=>`<div class="proposed"><time>${x.unplaced?'Не помещается':`${hm(x.start)}–${hm(x.end)}`}</time><div><strong>${esc(x.task.title)}</strong><small>${x.task.duration} мин${x.task.fixed?' · фиксировано':''}${x.unplaced?' · нужно изменить длительность или время':''}</small></div></div>`).join('');open('proposalOverlay')};
+$('settingsOpen').onclick=openSettings;$('settingsForm').onsubmit=e=>{e.preventDefault();const next={wakeTime:$('wakeTime').value,sleepTime:$('sleepTime').value,dayStart:$('dayStart').value,dayEnd:$('dayEnd').value,breakMin:Number($('breakMin').value),planStyle:$('planStyle').value};if(!next.dayStart||!next.dayEnd||mins(next.dayStart)>=mins(next.dayEnd)){toast('Конец рабочего окна должен быть позже начала в пределах одних суток');return}if(!Number.isFinite(next.breakMin)||next.breakMin<0||next.breakMin>60){toast('Перерыв должен быть от 0 до 60 минут');return}settings=next;save();close('settingsOverlay');render();toast('Правила сохранены')};
+$('replan').onclick=()=>{const list=dayTasks();if(!list.length){toast('Сначала добавь хотя бы одну задачу');return}proposal=buildSchedule(list);proposalSignature=JSON.stringify(list.map(t=>({id:t.id,date:t.date,title:t.title,duration:t.duration,time:t.time,fixed:t.fixed,priority:t.priority,done:t.done})));$('proposalList').innerHTML=proposal.map(x=>`<div class="proposed"><time>${x.unplaced?'Не помещается':`${hm(x.start)}–${hm(x.end)}`}</time><div><strong>${esc(x.task.title)}</strong><small>${x.task.duration} мин${x.task.fixed?' · фиксировано':''}${x.unplaced?' · нужно изменить длительность или время':''}</small></div></div>`).join('');open('proposalOverlay')};
 $('applyProposal').onclick=()=>{
  if(!proposal)return;
- const current=dayTasks(),fresh=buildSchedule(current);
+ const current=dayTasks(),signature=JSON.stringify(current.map(t=>({id:t.id,date:t.date,title:t.title,duration:t.duration,time:t.time,fixed:t.fixed,priority:t.priority,done:t.done})));if(signature!==proposalSignature){toast('Задачи изменились после построения черновика. Построй расписание заново');close('proposalOverlay');proposal=null;return;}
+ const fresh=buildSchedule(current);
  if(fresh.some(x=>x.unplaced)){toast('Некоторые задачи не помещаются в день. Исправь расписание перед применением');return}
  const timed=fresh.filter(x=>x.start!==null).sort((a,b)=>a.start-b.start);
  for(let i=0;i<timed.length;i++)for(let j=i+1;j<timed.length;j++){if(timed[j].start<timed[i].end&&timed[j].task.id!==timed[i].task.id){toast('Обнаружено пересечение задач. График не применён');return}}
@@ -225,41 +239,36 @@ function normalizeAIResponse(data){
   return {reply,plan:items.length?{date:plan.date,tasks:items}:null};
 }
 function applyAIPlan(index){
- const m=aiHistory[index];if(!m?.plan?.tasks?.length)return;
- const plan=m.plan;const planDate=new Date((plan.date||'')+'T00:00:00Z');const date=/^\d{4}-\d{2}-\d{2}$/.test(plan.date||'')&&!Number.isNaN(planDate.getTime())&&planDate.toISOString().slice(0,10)===plan.date?plan.date:selectedDate;
- const existing=tasks.filter(t=>t.date===date&&!t.done);
- const incoming=[];
- let skipped=0;
+ const m=aiHistory[index];if(!m?.plan?.tasks?.length||m.applied||m.dismissed)return;
+ const plan=m.plan;
+ const validDate=/^\d{4}-\d{2}-\d{2}$/.test(plan.date||'')&&(()=>{const d=new Date(plan.date+'T12:00:00');return !Number.isNaN(d.getTime())&&d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')===plan.date})();
+ if(!validDate){toast('В черновике некорректная дата. Попроси ИИ составить план заново');return;}
+ if(plan.date<todayKey()){toast('Это план на прошедшую дату. Попроси ИИ составить план на сегодня или будущий день');return;}
+ const date=plan.date,existing=tasks.filter(t=>t.date===date&&!t.done),incoming=[];let skipped=0;
  for(const item of plan.tasks){
-  if(!item||!String(item.title||'').trim())continue;
+  if(!item||!String(item.title||'').trim()){skipped++;continue;}
   const title=String(item.title).trim().slice(0,140);
-  if(/^(подъ[её]м|вставание|проснуться|пробуждение)$/i.test(title)){skipped++;continue}
-  const rawDuration=Number(item.duration);
-  if(!Number.isFinite(rawDuration)||rawDuration<5){skipped++;continue}
+  if(/^(подъ[её]м|вставание|проснуться|пробуждение)$/i.test(title)){skipped++;continue;}
+  const rawDuration=Number(item.duration);if(!Number.isFinite(rawDuration)||rawDuration<5||rawDuration>1440){skipped++;continue;}
   const duration=Math.max(5,Math.min(1440,Math.round(rawDuration/5)*5));
   const time=/^([01]\d|2[0-3]):[0-5]\d$/.test(item.time||'')?item.time:'';
-  const duplicate=[...existing,...incoming].some(t=>
-   t.title.trim().toLocaleLowerCase('ru-RU')===title.toLocaleLowerCase('ru-RU')&&
-   (t.time||'')===time&&Number(t.duration)===duration
-  );
-  if(duplicate){skipped++;continue}
+  const duplicate=[...existing,...incoming].some(t=>t.title.trim().toLocaleLowerCase('ru-RU')===title.toLocaleLowerCase('ru-RU')&&(t.time||'')===time&&Number(t.duration)===duration);
+  if(duplicate){skipped++;continue;}
   incoming.push({id:makeId(),title,duration,priority:['high','normal','low'].includes(item.priority)?item.priority:'normal',date,time,fixed:!!item.fixed,notes:String(item.notes||'').slice(0,500),done:false});
  }
- if(!incoming.length){toast(skipped?'Все задачи некорректны или уже есть в расписании':'В плане нет задач для добавления');return}
- // Проверяем конфликты до добавления хотя бы одной задачи.
- const intervals=[...existing,...incoming].filter(t=>t.time).map(t=>({title:t.title,start:mins(t.time),end:mins(t.time)+Number(t.duration||0),incoming:incoming.includes(t)})).sort((a,b)=>a.start-b.start);
- for(let i=0;i<intervals.length;i++){
-  for(let j=i+1;j<intervals.length;j++){
-   if(intervals[j].start>=intervals[i].end)break;
-   if(intervals[i].incoming||intervals[j].incoming){
-    toast(`План не добавлен: «${intervals[i].title}» пересекается с «${intervals[j].title}». Исправь время и попробуй снова.`);
-    return;
-   }
-  }
+ if(!incoming.length){toast(skipped?'Все задачи некорректны или уже есть в расписании':'В плане нет задач для добавления');return;}
+ // Explicitly timed tasks must not overlap existing tasks or each other; no writes occur before validation.
+ const timed=[...existing,...incoming].filter(t=>t.time).map(t=>({task:t,start:mins(t.time),end:mins(t.time)+Number(t.duration||0),incoming:incoming.includes(t)})).sort((a,b)=>a.start-b.start);
+ for(let i=0;i<timed.length;i++)for(let j=i+1;j<timed.length;j++){
+  if(timed[j].start>=timed[i].end)break;
+  if(timed[i].incoming||timed[j].incoming){toast(`План не добавлен: «${timed[i].task.title}» пересекается с «${timed[j].task.title}». Исправь время и попробуй снова.`);return;}
  }
- tasks.push(...incoming);
- selectedDate=date;save();render();m.applied=true;m.plan=null;saveAIHistory();renderAIHistory();close('aiOverlay');
- toast(`Добавлено задач: ${incoming.length}${skipped?`; пропущено: ${skipped}`:''}`)
+ const preview=buildSchedule([...existing,...incoming]);
+ const impossible=preview.filter(x=>x.unplaced&&incoming.some(t=>t.id===x.task.id));
+ if(impossible.some(x=>x.task.fixed)){toast('Фиксированное событие не помещается или конфликтует с другим. План не добавлен — попроси ИИ исправить время');return;}
+ if(impossible.length){const names=impossible.slice(0,2).map(x=>'«'+x.task.title+'»').join(', ');if(!confirm(`${impossible.length} гибких задач не помещаются в рабочее окно (${names}). Добавить их без назначенного времени, чтобы переставить вручную?`))return;const ids=new Set(impossible.map(x=>x.task.id));incoming.forEach(t=>{if(ids.has(t.id)){t.time='';t.fixed=false;}});}
+ tasks.push(...incoming);selectedDate=date;save();render();m.applied=true;m.plan=null;saveAIHistory();renderAIHistory();close('aiOverlay');
+ toast(`Добавлено задач: ${incoming.length}${skipped?`; пропущено: ${skipped}`:''}`);
 }
 async function sendAIMessage(raw){const message=String(raw||'').trim();if(!message||aiBusy)return;pushAI('user',message);$('aiInput').value='';aiBusy=true;$('aiSend').disabled=true;$('aiSend').textContent='…';const pending=document.createElement('div');pending.className='ai-message system';pending.textContent='ИИ думает…';pending.id='aiPending';$('aiMessages').append(pending);$('aiMessages').scrollTop=$('aiMessages').scrollHeight;
 try{const taskContext=tasks.filter(t=>!t.done).slice(0,30).map(t=>`- ${t.date}: ${t.title} (${t.duration} мин${t.time?', '+t.time:''})`).join('\n')||'Нет незавершённых задач';const contextualMessage=`Запрос пользователя: ${message}
@@ -270,7 +279,7 @@ try{const taskContext=tasks.filter(t=>!t.done).slice(0,30).map(t=>`- ${t.date}: 
 Незавершённые задачи:
 ${taskContext}
 
-Верни JSON по системному контракту.`;const conversationHistory=aiHistory.slice(0,-1).filter(m=>['user','assistant'].includes(m.role)).slice(-12).map(m=>({role:m.role,content:(m.content+(m.role==='assistant'&&m.plan?'\n[Структурированный план, который был предложен ранее: '+JSON.stringify(m.plan)+']':'')).slice(0,1800)}));const response=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:contextualMessage,history:conversationHistory})});let data={};try{data=await response.json()}catch{}if(!response.ok)throw new Error(data.error||data.message||`Ошибка сервера (${response.status})`);const normalized=normalizeAIResponse(data);$('aiPending')?.remove();pushAI('assistant',normalized.reply,normalized.plan)}catch(err){$('aiPending')?.remove();pushAI('assistant',`Не получилось получить ответ: ${err.message||'ошибка соединения'}. Проверь подключение и настройки /api/chat в Cloudflare.`)}finally{aiBusy=false;$('aiSend').disabled=false;$('aiSend').textContent='➤';$('aiInput').focus()}}
+Верни JSON по системному контракту.`;const conversationHistory=aiHistory.slice(0,-1).filter(m=>['user','assistant'].includes(m.role)).slice(-12).map(m=>({role:m.role,content:(m.content+(m.role==='assistant'&&m.plan?'\n[Структурированный план, который был предложен ранее: '+JSON.stringify(m.plan)+']':'')).slice(0,1800)}));const controller=new AbortController();const timeoutId=setTimeout(()=>controller.abort(),60000);let response,data={};try{response=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:contextualMessage,history:conversationHistory}),signal:controller.signal});try{data=await response.json()}catch{}}finally{clearTimeout(timeoutId)}if(!response.ok)throw new Error(data.error||data.message||`Ошибка сервера (${response.status})`);const normalized=normalizeAIResponse(data);$('aiPending')?.remove();pushAI('assistant',normalized.reply,normalized.plan)}catch(err){$('aiPending')?.remove();const detail=err?.name==='AbortError'?'Запрос занял больше 60 секунд и был остановлен на стороне браузера.':(err.message||'ошибка соединения');pushAI('assistant',`Не получилось получить ответ: ${detail} Проверь подключение и настройки /api/chat в Cloudflare.`)}finally{aiBusy=false;$('aiSend').disabled=false;$('aiSend').textContent='➤';$('aiInput').focus()}}
 $('aiForm').onsubmit=e=>{e.preventDefault();sendAIMessage($('aiInput').value)};
 $('clearAIChat').onclick=()=>{
  if(aiBusy){toast('Дождись ответа ИИ, затем очисти чат');return}
