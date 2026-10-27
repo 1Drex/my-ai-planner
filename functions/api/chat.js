@@ -16,6 +16,7 @@ export async function onRequestPost({ request, env }) {
     const MAX_MESSAGE = 8000;
     const MAX_HISTORY_ITEMS = 12;
     const MAX_HISTORY_CONTENT = 1800;
+    const repairRequest = body?.repair && typeof body.repair === 'object' ? body.repair : null;
     const userMessage = String(body?.message || '').trim().slice(0, MAX_MESSAGE);
     if (!userMessage) return jsonResponse({ error: 'Пустое сообщение.' }, 400);
 
@@ -56,7 +57,8 @@ export async function onRequestPost({ request, env }) {
           .map(m => ({ role: m.role, content: m.content.slice(0, MAX_HISTORY_CONTENT) }))
       : [];
     // Keep the request bounded even when history contains many long messages.
-    const messages = [{ role: 'system', content: system }, ...history, { role: 'user', content: userMessage }];
+    const repairInstruction = repairRequest ? `\n\nРЕЖИМ ИСПРАВЛЕНИЯ ЧЕРНОВИКА: не составляй новый план с нуля. Исправь переданный черновик минимально. Сохрани все фиксированные события с теми же названиями, датами, временем и длительностью; сохрани суммарную длительность учебных задач; не добавляй задачи подъёма/сна. Устрани все пересечения. Верни только JSON-контракт.\nКонфликты, найденные сервером: ${JSON.stringify(repairRequest.conflicts || []).slice(0, 3000)}\nЧерновик для исправления: ${JSON.stringify(repairRequest.draft || {}).slice(0, 7000)}` : '';
+    const messages = [{ role: 'system', content: system + repairInstruction }, ...history, { role: 'user', content: userMessage }];
 
     function extractText(value, depth = 0, seen = new WeakSet()) {
       if (depth > 7 || value == null) return '';
@@ -174,79 +176,83 @@ export async function onRequestPost({ request, env }) {
 
     let reply = typeof parsed.reply === 'string' ? parsed.reply.slice(0, 5000) : '';
     if (!reply.trim()) reply = 'ИИ вернул пустой ответ.';
-    let plan = null;
-    let planWasSupplied = parsed.plan != null;
-    let planDiscardReason = '';
 
-    if (parsed.plan && typeof parsed.plan.date === 'string' && Array.isArray(parsed.plan.tasks)) {
-      const date = parsed.plan.date;
-      const validDate = /^\d{4}-\d{2}-\d{2}$/.test(date) &&
-        !Number.isNaN(Date.parse(date + 'T00:00:00Z')) &&
-        new Date(date + 'T00:00:00Z').toISOString().slice(0, 10) === date;
-
-      const rawTasks = parsed.plan.tasks.slice(0, 30);
-      const isFixed = v => v === true || v === 'true' || v === 1;
-      const validTaskTime = v => typeof v === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(v);
-      const hasInvalidFixed = rawTasks.some(t => t && isFixed(t.fixed) && !validTaskTime(t.time));
-      const tasks = rawTasks
-        .filter(t => t && typeof t.title === 'string' && t.title.trim())
+    const isFixed = v => v === true || v === 'true' || v === 1;
+    const validTime = v => typeof v === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(v);
+    const toMin = v => { const [h, m] = v.split(':').map(Number); return h * 60 + m; };
+    const normalizePlan = candidate => {
+      if (!candidate || typeof candidate.date !== 'string' || !Array.isArray(candidate.tasks)) return { plan: null, reason: 'Структура черновика плана оказалась некорректной.', conflicts: [], draft: candidate || null };
+      const date = candidate.date;
+      const validDate = /^\d{4}-\d{2}-\d{2}$/.test(date) && !Number.isNaN(Date.parse(date + 'T00:00:00Z')) && new Date(date + 'T00:00:00Z').toISOString().slice(0, 10) === date;
+      const rawTasks = candidate.tasks.slice(0, 30);
+      const hasInvalidFixed = rawTasks.some(t => t && isFixed(t.fixed) && !validTime(t.time));
+      let tasks = rawTasks.filter(t => t && typeof t.title === 'string' && t.title.trim())
         .filter(t => !/^(подъ[её]м|вставание|проснуться|пробуждение)$/i.test(t.title.trim()))
-        .map(t => {
-          const n = Number(t.duration);
-          const duration = Number.isFinite(n) && n >= 5 ? Math.min(1440, Math.round(n / 5) * 5) : 0;
-          return {
-            title: t.title.trim().slice(0, 140),
-            duration,
-            time: typeof t.time === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(t.time) ? t.time : '',
-            priority: ['high', 'normal', 'low'].includes(t.priority) ? t.priority : 'normal',
-            fixed: isFixed(t.fixed) && validTaskTime(t.time),
-            notes: typeof t.notes === 'string' ? t.notes.slice(0, 500) : ''
-          };
-        })
+        .map(t => { const n = Number(t.duration); return { title: t.title.trim().slice(0,140), duration: Number.isFinite(n) && n >= 5 ? Math.min(1440, Math.round(n/5)*5) : 0, time: validTime(t.time) ? t.time : '', priority: ['high','normal','low'].includes(t.priority) ? t.priority : 'normal', fixed: isFixed(t.fixed) && validTime(t.time), notes: typeof t.notes === 'string' ? t.notes.slice(0,500) : '' }; })
         .filter(t => t.duration >= 5);
-
-      // If the model returned one long timed study task and also invented breaks beside it,
-      // the client will split the long task and create breaks deterministically. Drop those
-      // model-generated breaks before overlap validation so they cannot invalidate the plan.
-      const hasLongTimedStudy = tasks.some(t =>
-        t.time && t.duration > 120 && /(уч[её]б|учиться|обучен|подготовк|программирован|лабораторн|домашн.{0,10}задан|чтени|работ.{0,10}над)/i.test(t.title)
-      );
-      if (hasLongTimedStudy) {
-        for (let i = tasks.length - 1; i >= 0; i--) {
-          if (/^перерыв(?: между учебными блоками)?$/i.test(tasks[i].title.trim())) tasks.splice(i, 1);
-        }
+      const hasLongTimedStudy = tasks.some(t => t.time && t.duration > 120 && /(уч[её]б|учиться|обучен|подготовк|программирован|лабораторн|домашн.{0,10}задан|чтени|работ.{0,10}над)/i.test(t.title));
+      if (hasLongTimedStudy) tasks = tasks.filter(t => !/^перерыв(?: между учебными блоками)?$/i.test(t.title.trim()));
+      const timed = tasks.filter(t => t.time).map(t => ({ ...t, start: toMin(t.time) })).sort((a,b) => a.start-b.start);
+      const conflicts = [];
+      for (let i=0;i<timed.length;i++) for (let j=i+1;j<timed.length;j++) {
+        if (timed[j].start >= timed[i].start + timed[i].duration) break;
+        conflicts.push({ a: { title: timed[i].title, time: timed[i].time, duration: timed[i].duration, fixed: timed[i].fixed }, b: { title: timed[j].title, time: timed[j].time, duration: timed[j].duration, fixed: timed[j].fixed } });
       }
+      let reason = '';
+      if (!validDate) reason = 'Указана некорректная дата.';
+      else if (hasInvalidFixed) reason = 'Фиксированное событие не содержит корректного времени начала.';
+      else if (!tasks.length) reason = 'Все задачи в черновике имели некорректную или слишком короткую длительность.';
+      else if (conflicts.length) reason = 'В черновике обнаружено пересечение времени.';
+      else if (timed.some(t => t.start + t.duration > 1440)) reason = 'Одна из задач выходит за пределы суток.';
+      return { plan: reason ? null : { date, tasks }, reason, conflicts, draft: { date, tasks } };
+    };
+    const planWasSupplied = parsed.plan != null;
+    let checked = normalizePlan(parsed.plan);
+    let plan = checked.plan;
 
-      const timed = tasks.filter(t => t.time).map(t => {
-        const [h, m] = t.time.split(':').map(Number);
-        return { ...t, start: h * 60 + m };
-      }).sort((a, b) => a.start - b.start);
-
-      let overlap = false;
-      for (let i = 0; i < timed.length && !overlap; i++) {
-        for (let j = i + 1; j < timed.length; j++) {
-          if (timed[j].start >= timed[i].start + timed[i].duration) break;
-          overlap = true;
-          break;
-        }
+    // A user-triggered repair must preserve the original fixed events and total study time too.
+    if (repairRequest) {
+      const original = repairRequest.draft;
+      const fixedKey = t => `${t.title.toLocaleLowerCase('ru-RU')}|${t.time}|${t.duration}`;
+      const fixedBefore = (original?.tasks || []).filter(t => t && isFixed(t.fixed)).map(fixedKey).sort();
+      const fixedAfter = (checked.draft?.tasks || []).filter(t => t && isFixed(t.fixed)).map(fixedKey).sort();
+      const studyRe = /(уч[её]б|учиться|обучен|подготовк|программирован|лабораторн|домашн.{0,10}задан|чтени|работ.{0,10}над)/i;
+      const studyTotal = p => (p?.tasks || []).filter(t => studyRe.test(t.title)).reduce((sum,t) => sum + Number(t.duration || 0), 0);
+      const integrityOk = !!checked.plan && checked.draft?.date === original?.date && JSON.stringify(fixedBefore) === JSON.stringify(fixedAfter) && studyTotal(original) === studyTotal(checked.draft);
+      if (!integrityOk) {
+        checked = { plan: null, reason: 'Исправление изменило фиксированные события или общую длительность учёбы либо не устранило ошибки.', conflicts: Array.isArray(repairRequest.conflicts) ? repairRequest.conflicts : [], draft: original || checked.draft };
+        plan = null;
       }
+    }
 
-      if (!validDate) planDiscardReason = 'Указана некорректная дата.';
-      else if (hasInvalidFixed) planDiscardReason = 'Фиксированное событие не содержит корректного времени начала.';
-      else if (!tasks.length) planDiscardReason = 'Все задачи в черновике имели некорректную или слишком короткую длительность.';
-      else if (overlap) planDiscardReason = 'В черновике обнаружилось пересечение времени.';
-      else if (timed.some(t => t.start + t.duration > 1440)) planDiscardReason = 'Одна из задач выходит за пределы суток.';
-      else plan = { date, tasks };
-    } else if (planWasSupplied) {
-      planDiscardReason = 'Структура черновика плана оказалась некорректной.';
+    // One automatic, targeted repair when the first structured plan contains overlaps.
+    // A user-triggered repair request is itself the one manual retry; do not recurse again.
+    if (planWasSupplied && !plan && checked.conflicts.length && !repairRequest) {
+      try {
+        const repairPrompt = `Исправь этот черновик минимально. Найденные пересечения: ${JSON.stringify(checked.conflicts)}. Черновик: ${JSON.stringify(checked.draft)}. Сохрани все фиксированные задачи без изменения title/time/duration/date, а также суммарную длительность учебных задач. Устрани пересечения и не создавай задачи на подъём/сон. Верни только JSON {"reply":"...","plan":{"date":"YYYY-MM-DD","tasks":[...]}}.`;
+        const repairedRaw = extractText(await env.AI.run('@cf/mistralai/mistral-small-3.1-24b-instruct', { messages: [{role:'system',content:system}, ...history, {role:'user',content:repairPrompt}], max_tokens:1600, temperature:0 }));
+        const repairedParsed = parseEnvelope(repairedRaw.trim().replace(/^```(?:json|text)?\s*/i,'').replace(/\s*```$/,''));
+        if (repairedParsed?.plan) {
+          const candidate = normalizePlan(repairedParsed.plan);
+          const fixedKey = t => `${t.title.toLocaleLowerCase('ru-RU')}|${t.time}|${t.duration}`;
+          const fixedBefore = checked.draft.tasks.filter(t=>t.fixed).map(fixedKey).sort();
+          const fixedAfter = candidate.draft?.tasks?.filter(t=>t.fixed).map(fixedKey).sort() || [];
+          const studyRe = /(уч[её]б|учиться|обучен|подготовк|программирован|лабораторн|домашн.{0,10}задан|чтени|работ.{0,10}над)/i;
+          const studyTotal = p => (p?.tasks||[]).filter(t=>studyRe.test(t.title)).reduce((s,t)=>s+t.duration,0);
+          const fixedPreserved = candidate.draft?.date === checked.draft?.date && JSON.stringify(fixedBefore) === JSON.stringify(fixedAfter);
+          const studyPreserved = Math.abs(studyTotal(checked.draft)-studyTotal(candidate.draft)) <= 0;
+          if (candidate.plan && fixedPreserved && studyPreserved) { checked = candidate; plan = candidate.plan; reply = repairedParsed.reply || 'Исправил пересечения. Проверь черновик перед добавлением.'; }
+        }
+      } catch (error) { console.error('[chat] overlap repair failed:', error?.message || error); }
     }
 
     if (planWasSupplied && !plan) {
-      reply += '\n\nЯ не передаю черновик в расписание: ' + (planDiscardReason || 'план не прошёл проверку.') + ' Попробуй попросить меня составить план заново.';
-    } else if (!plan && /(?:вот (?:твой |ваш )?план|план готов|составил(?:а)? план|расписание готово|я распределил(?:а)? задачи)/i.test(reply)) {
-      reply += '\n\nВажно: структурированный черновик не был получен, поэтому задачи не добавлены. Попроси меня повторить построение плана.';
+      const diagnostic = checked.conflicts.length ? checked.conflicts.map(c => `«${c.a.title}» ${c.a.time}–${String(Math.floor((toMin(c.a.time)+c.a.duration)/60)).padStart(2,'0')}:${String((toMin(c.a.time)+c.a.duration)%60).padStart(2,'0')} пересекается с «${c.b.title}» ${c.b.time}–${String(Math.floor((toMin(c.b.time)+c.b.duration)/60)).padStart(2,'0')}:${String((toMin(c.b.time)+c.b.duration)%60).padStart(2,'0')}`).join('; ') : checked.reason;
+      reply += '\n\nЧерновик не добавлен: ' + (diagnostic || 'план не прошёл проверку.') + (checked.conflicts.length ? ' Можно нажать «Попробовать исправить» для одной дополнительной попытки.' : ' Задачи не изменены.');
+      return jsonResponse({ reply, plan: null, conflicts: checked.conflicts, draft: checked.draft, canRepair: checked.conflicts.length > 0 && !repairRequest });
     }
-    return jsonResponse({ reply, plan });
+    if (!plan && /(?:вот (?:твой |ваш )?план|план готов|составил(?:а)? план|расписание готово|я распределил(?:а)? задачи)/i.test(reply)) reply += '\n\nВажно: структурированный черновик не был получен, поэтому задачи не добавлены.';
+    return jsonResponse({ reply, plan, conflicts: [], draft: null, canRepair: false });
   } catch (error) {
     console.error('[chat] Workers AI request failed:', error?.stack || error?.message || error);
     return jsonResponse({ error: 'Не удалось обработать запрос ИИ. Попробуй ещё раз.' }, 500);
