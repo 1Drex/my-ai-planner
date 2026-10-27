@@ -84,7 +84,7 @@ export async function onRequestPost({ request, env }) {
 
     let result, raw = '';
     for (let attempt = 0; attempt < 2 && !raw.trim(); attempt++) {
-      result = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
+      result = await env.AI.run('@cf/mistralai/mistral-small-3.1-24b-instruct', {
         messages,
         max_tokens: 1600,
         temperature: 0.1
@@ -124,7 +124,7 @@ export async function onRequestPost({ request, env }) {
     const currentIsAffirmative = /^(?:да|да,?\s*(?:давай|составляй|подходит|реалистично|верно)?|думаю,?\s*да|ок|хорошо|согласен|согласна)[.!?\s]*$/i.test(currentRequest);
     if (parsed && !parsed.plan && currentIsAffirmative) {
       try {
-        const retry = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
+        const retry = await env.AI.run('@cf/mistralai/mistral-small-3.1-24b-instruct', {
           messages: [
             { role: 'system', content: system + '\n\nОСОБОЕ УКАЗАНИЕ: последняя реплика пользователя — подтверждение твоего предыдущего предложения. Не задавай вопрос. Составь структурированный план на основе всей истории и уже указанных ограничений. Верни JSON с plan.tasks, если только в истории действительно нет никаких задач или временных ограничений.' },
             ...history,
@@ -142,7 +142,7 @@ export async function onRequestPost({ request, env }) {
     if (!parsed) {
       // One repair attempt: ask the model to return a valid envelope, preserving the original request/history.
       try {
-        const repair = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
+        const repair = await env.AI.run('@cf/mistralai/mistral-small-3.1-24b-instruct', {
           messages: [
             { role: 'system', content: 'Верни корректный JSON строго вида {\"reply\":\"...\",\"plan\":null} или {\"reply\":\"...\",\"plan\":{\"date\":\"YYYY-MM-DD\",\"tasks\":[...]}}. Если исходный ответ содержит JSON, исправь его синтаксис и сохрани смысл. Если исходный ответ не содержит пригодного плана, составь план по запросу пользователя и истории. Не добавляй Markdown и никаких пояснений вне JSON.' },
             { role: 'user', content: ('Исходный запрос пользователя и контекст:\n' + userMessage + '\n\nПредыдущий ответ модели для восстановления, если полезен:\n' + cleaned).slice(0, 9000) }
